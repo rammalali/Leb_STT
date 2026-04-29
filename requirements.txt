@@ -1,11 +1,21 @@
+# Web server
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 python-dotenv==1.0.1
 pydantic==2.9.2
-torch>=2.2
+
+# ASR (Whisper)
+# NOTE: install torch from the matching CUDA channel BEFORE this file, e.g.
+#   pip install --index-url https://download.pytorch.org/whl/cu126 torch torchvision
+torch>=2.2,<2.10
 transformers>=4.46.0
 accelerate>=1.0.0
+
+# Audio decoding
 librosa>=0.10.2
 soundfile>=0.12.1
-pyannote-audio>=3.3.0
+
+# Speaker diarization (open, no gated models)
+speechbrain>=1.0.0
+scikit-learn>=1.3.0

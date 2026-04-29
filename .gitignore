@@ -1,14 +1,19 @@
 .env
-__pycache__/
-*.pyc
 .venv/
 venv/
+__pycache__/
+*.pyc
+
 .idea/
 .vscode/
+
 uploads/
 *.wav
 *.mp3
 *.m4a
 *.mp4a
 
+pretrained_models/
+
 hf_space/
+space_client/

@@ -62,13 +62,7 @@ class LocalTransformersBackend:
                 self._pipeline = self._build_pipeline()
         return self._pipeline
 
-    def _run_sync(
-        self,
-        path: str,
-        language: str | None,
-        prompt: str | None,
-        word_timestamps: bool = False,
-    ) -> dict:
+    def _build_generate_kwargs(self, language: str | None, prompt: str | None) -> dict[str, Any]:
         pipe = self._ensure_pipeline()
         generate_kwargs: dict[str, Any] = {}
         if language:
@@ -82,26 +76,61 @@ class LocalTransformersBackend:
                 generate_kwargs["prompt_ids"] = prompt_ids
             except Exception as e:
                 raise TranscriptionError(400, f"Failed to encode prompt: {e}") from e
+        return generate_kwargs
 
+    @staticmethod
+    def _decode_audio(pipe: Any, path: str) -> tuple[Any, int]:
         try:
             import librosa  # type: ignore
         except ImportError as e:
             raise TranscriptionError(500, "librosa is required to decode audio.") from e
-
         try:
             target_sr = pipe.feature_extractor.sampling_rate
             audio_array, sr = librosa.load(path, sr=target_sr, mono=True)
         except Exception as e:
             raise TranscriptionError(400, f"Could not decode audio file: {e}") from e
+        return audio_array, sr
+
+    def _run_sync(
+        self,
+        path: str,
+        options: TranscribeOptions,
+        word_timestamps: bool,
+        keep_audio: bool,
+    ) -> dict:
+        pipe = self._ensure_pipeline()
+        generate_kwargs = self._build_generate_kwargs(options.language, options.prompt)
+        audio_array, sr = self._decode_audio(pipe, path)
 
         call_kwargs: dict[str, Any] = {"generate_kwargs": generate_kwargs}
         if word_timestamps:
             call_kwargs["return_timestamps"] = "word"
 
         out = pipe({"array": audio_array, "sampling_rate": sr}, **call_kwargs)
-        if not isinstance(out, dict):
-            return {"text": str(out), "chunks": []}
-        return {"text": out.get("text", ""), "chunks": out.get("chunks", [])}
+        text = out.get("text", "") if isinstance(out, dict) else str(out)
+        chunks = out.get("chunks", []) if isinstance(out, dict) else []
+
+        result: dict[str, Any] = {"text": text, "chunks": chunks}
+        if keep_audio:
+            result["audio_array"] = audio_array
+            result["sampling_rate"] = sr
+        return result
+
+    async def _run(
+        self,
+        path: str,
+        options: TranscribeOptions,
+        word_timestamps: bool,
+        keep_audio: bool,
+    ) -> dict:
+        try:
+            return await asyncio.to_thread(
+                self._run_sync, path, options, word_timestamps, keep_audio
+            )
+        except TranscriptionError:
+            raise
+        except Exception as e:
+            raise TranscriptionError(500, f"Transcription failed: {e}") from e
 
     async def transcribe(self, audio: bytes, filename: str, options: TranscribeOptions) -> dict:
         suffix = Path(filename).suffix or ".bin"
@@ -110,14 +139,7 @@ class LocalTransformersBackend:
             tmp_path = tmp.name
 
         try:
-            try:
-                result = await asyncio.to_thread(
-                    self._run_sync, tmp_path, options.language, options.prompt
-                )
-            except TranscriptionError:
-                raise
-            except Exception as e:
-                raise TranscriptionError(500, f"Transcription failed: {e}") from e
+            result = await self._run(tmp_path, options, word_timestamps=False, keep_audio=False)
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
@@ -128,20 +150,15 @@ class LocalTransformersBackend:
             "dtype": self._dtype_repr,
         }
 
-    async def transcribe_with_timestamps(
-        self, path: str, options: TranscribeOptions
-    ) -> dict:
-        try:
-            result = await asyncio.to_thread(
-                self._run_sync, path, options.language, options.prompt, True
-            )
-        except TranscriptionError:
-            raise
-        except Exception as e:
-            raise TranscriptionError(500, f"Transcription failed: {e}") from e
+    async def transcribe_with_audio(self, path: str, options: TranscribeOptions) -> dict:
+        """Transcribe with word timestamps and return the loaded audio array
+        so callers (e.g. diarization) don't need to reload it."""
+        result = await self._run(path, options, word_timestamps=True, keep_audio=True)
         return {
             "text": result["text"],
             "chunks": result["chunks"],
+            "audio_array": result["audio_array"],
+            "sampling_rate": result["sampling_rate"],
             "model": self._settings.model_id,
             "device": self._device,
             "dtype": self._dtype_repr,

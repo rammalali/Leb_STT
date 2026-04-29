@@ -12,7 +12,6 @@ class Settings:
     hf_token: str | None
     language: str | None
     prompt: str | None
-    diarization_model: str
     default_num_speakers: int | None
     host: str
     port: int
@@ -37,7 +36,6 @@ def load_settings() -> Settings:
         hf_token=hf_token,
         language=os.getenv("TRANSCRIBE_LANGUAGE", "arabic").strip() or None,
         prompt=os.getenv("TRANSCRIBE_PROMPT", "").strip() or None,
-        diarization_model=os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1").strip(),
         default_num_speakers=default_num_speakers,
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),

@@ -1,4 +1,4 @@
-"""Verify CUDA is available to torch. Run before using the local backend."""
+"""Verify CUDA is visible to torch. Run before using the backend."""
 import sys
 
 
@@ -6,7 +6,7 @@ def main() -> int:
     try:
         import torch
     except ImportError:
-        print("torch is not installed. Run: pip install -r requirements-local.txt")
+        print("torch is not installed. Run: pip install -r requirements.txt")
         return 1
 
     print(f"torch version:      {torch.__version__}")
@@ -21,9 +21,10 @@ def main() -> int:
 
     print()
     print("CUDA is NOT available. Likely cause: torch was installed as the CPU build.")
-    print("Reinstall torch matching your CUDA driver. Examples:")
-    print("  CUDA 12.1:  pip install --index-url https://download.pytorch.org/whl/cu121 torch")
-    print("  CUDA 12.4:  pip install --index-url https://download.pytorch.org/whl/cu124 torch")
+    print("Reinstall the CUDA wheels matching your NVIDIA driver. Examples:")
+    print("  CUDA 12.6:  pip install --index-url https://download.pytorch.org/whl/cu126 torch torchvision torchaudio")
+    print("  CUDA 12.4:  pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision torchaudio")
+    print("  CUDA 12.1:  pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio")
     return 2
 
 

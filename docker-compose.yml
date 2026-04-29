@@ -1,0 +1,27 @@
+services:
+  leb_stt:
+    build: .
+    image: leb-stt:latest
+    container_name: leb_stt
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+      - pretrained_models:/app/pretrained_models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  hf_cache:
+  pretrained_models:

@@ -7,13 +7,13 @@ from fastapi.responses import JSONResponse
 
 from .backends import ALLOWED_EXTS, LocalTransformersBackend, TranscribeOptions, TranscriptionError
 from .config import load_settings
-from .diarize import DiarizationError, Diarizer, relabel, render_text, stitch
+from .diarize import DiarizationError, Diarizer, relabel, render_text
 
 settings = load_settings()
 backend = LocalTransformersBackend(settings)
 diarizer = Diarizer(settings)
 
-app = FastAPI(title="Leb_STT", version="0.5.0")
+app = FastAPI(title="Leb_STT", version="0.6.0")
 
 
 @app.get("/health")
@@ -25,7 +25,7 @@ async def health() -> dict:
     }
 
 
-def _validate_audio(file: UploadFile) -> tuple[str, str]:
+def _validate_audio(file: UploadFile) -> str:
     filename = file.filename or "audio"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext not in ALLOWED_EXTS:
@@ -33,42 +33,40 @@ def _validate_audio(file: UploadFile) -> tuple[str, str]:
             status_code=400,
             detail=f"Unsupported file extension '.{ext}'. Allowed: {sorted(ALLOWED_EXTS)}",
         )
-    return filename, ext
-
-
-def _parse_int(value: str | None, field: str) -> int | None:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        raise HTTPException(400, f"'{field}' must be an integer.")
+    return filename
 
 
 @app.post("/transcribe")
 async def transcribe(
     file: UploadFile = File(...),
-    language: str | None = Form(default=None),
-    prompt: str | None = Form(default=None),
-    num_speakers: str | None = Form(default=None),
-    min_speakers: str | None = Form(default=None),
-    max_speakers: str | None = Form(default=None),
+    language: str = Form(default="", description="Whisper language hint (e.g. 'arabic'). Empty = auto-detect."),
+    prompt: str = Form(default="", description="Decoder prompt. ~224 tokens max."),
+    num_speakers: int | None = Form(
+        default=None,
+        description="Pin speaker count. >=2 enables diarization.",
+    ),
+    min_speakers: int | None = Form(
+        default=None,
+        description="Lower bound for speaker count. >=2 enables diarization.",
+    ),
+    max_speakers: int | None = Form(
+        default=None,
+        description="Upper bound for speaker count. >=2 enables diarization.",
+    ),
 ) -> JSONResponse:
-    filename, _ = _validate_audio(file)
+    filename = _validate_audio(file)
     audio = await file.read()
     if not audio:
         raise HTTPException(status_code=400, detail="Empty file.")
 
     options = TranscribeOptions(
-        language=(language.strip() if language else None) or settings.language,
-        prompt=(prompt.strip() if prompt else None) or settings.prompt,
+        language=language.strip() or settings.language,
+        prompt=prompt.strip() or settings.prompt,
     )
 
-    n = _parse_int(num_speakers, "num_speakers")
-    if n is None:
-        n = settings.default_num_speakers
-    mn = _parse_int(min_speakers, "min_speakers")
-    mx = _parse_int(max_speakers, "max_speakers")
+    n = num_speakers if num_speakers is not None else settings.default_num_speakers
+    mn = min_speakers
+    mx = max_speakers
 
     diarize = (
         (n is not None and n >= 2)
@@ -90,28 +88,36 @@ async def transcribe(
 
     try:
         try:
-            asr_task = backend.transcribe_with_timestamps(tmp_path, options)
-            diarize_task = asyncio.to_thread(
-                diarizer.diarize, tmp_path, n, mn, mx
-            )
-            asr_result, segments = await asyncio.gather(asr_task, diarize_task)
+            asr_result = await backend.transcribe_with_audio(tmp_path, options)
         except TranscriptionError as e:
             raise HTTPException(status_code=e.status, detail=e.detail)
+
+        try:
+            lines, raw_segments = await asyncio.to_thread(
+                diarizer.diarize_chunks,
+                asr_result["audio_array"],
+                asr_result["sampling_rate"],
+                asr_result["chunks"],
+                n,
+                mn,
+                mx,
+            )
         except DiarizationError as e:
             raise HTTPException(status_code=e.status, detail=e.detail)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
-    lines = relabel(stitch(segments, asr_result["chunks"]))
+    labeled_lines = relabel(lines)
+    labeled_segments = relabel(raw_segments)
 
     return JSONResponse(
         {
             "text": asr_result["text"],
-            "labeled_text": render_text(lines),
-            "lines": lines,
-            "speaker_segments": segments,
+            "labeled_text": render_text(labeled_lines),
+            "lines": labeled_lines,
+            "speaker_segments": labeled_segments,
             "model": asr_result["model"],
             "device": asr_result["device"],
-            "diarization_model": settings.diarization_model,
+            "diarization_backend": "speechbrain-ecapa",
         }
     )

@@ -1,7 +1,24 @@
+"""Open-source speaker diarization using SpeechBrain ECAPA-TDNN + clustering.
+
+No gated models, no HF token required. Pipeline:
+  1. Group Whisper word-timestamps into utterances by silence gaps.
+  2. Slice the audio per utterance and compute an ECAPA-TDNN voice embedding.
+  3. Cluster embeddings (agglomerative cosine) with optional num_speakers pin.
+  4. Merge consecutive same-speaker utterances into lines.
+"""
+import logging
 import threading
+import traceback
 from typing import Any
 
 from .config import Settings
+
+logger = logging.getLogger("leb_stt.diarize")
+
+ENCODER_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
+GAP_THRESHOLD_S = 0.6
+MIN_UTT_S = 0.3
+DEFAULT_DISTANCE_THRESHOLD = 0.7
 
 
 class DiarizationError(Exception):
@@ -14,45 +31,19 @@ class DiarizationError(Exception):
 class Diarizer:
     def __init__(self, settings: Settings):
         self._settings = settings
-        self._pipeline: Any = None
+        self._encoder: Any = None
         self._device: str = "cpu"
         self._lock = threading.Lock()
 
     def _build(self) -> Any:
         try:
             import torch  # type: ignore
-            from pyannote.audio import Pipeline  # type: ignore
+            from speechbrain.inference.speaker import EncoderClassifier  # type: ignore
         except ImportError as e:
             raise DiarizationError(
                 500,
-                "pyannote.audio is not installed. Run: pip install -r requirements.txt",
+                "Diarization needs speechbrain. Run: pip install -r requirements.txt",
             ) from e
-
-        if not self._settings.hf_token:
-            raise DiarizationError(
-                400,
-                "Diarization requires HF_TOKEN. Accept the model terms on HF and set HF_TOKEN in .env.",
-            )
-
-        try:
-            pipe = Pipeline.from_pretrained(
-                self._settings.diarization_model,
-                use_auth_token=self._settings.hf_token,
-            )
-        except Exception as e:
-            raise DiarizationError(
-                500,
-                f"Could not load diarization model '{self._settings.diarization_model}'. "
-                "Did you accept the gated-model terms on huggingface.co? "
-                f"Underlying error: {e}",
-            ) from e
-
-        if pipe is None:
-            raise DiarizationError(
-                500,
-                f"Pipeline.from_pretrained returned None for '{self._settings.diarization_model}'. "
-                "Most common cause: HF_TOKEN doesn't have access to the gated repo.",
-            )
 
         requested = self._settings.device
         if requested == "auto":
@@ -62,101 +53,168 @@ class Diarizer:
         else:
             use_cuda = False
 
-        if use_cuda:
-            pipe.to(torch.device("cuda"))
-            self._device = "cuda"
-        else:
-            self._device = "cpu"
+        self._device = "cuda" if use_cuda else "cpu"
 
-        return pipe
+        kwargs: dict[str, Any] = {
+            "source": ENCODER_MODEL,
+            "savedir": "pretrained_models/spkrec-ecapa-voxceleb",
+            "run_opts": {"device": self._device},
+        }
+        try:
+            from speechbrain.utils.fetching import LocalStrategy  # type: ignore
+            kwargs["local_strategy"] = LocalStrategy.COPY
+        except ImportError:
+            pass
+
+        try:
+            encoder = EncoderClassifier.from_hparams(**kwargs)
+        except Exception as e:
+            logger.error("SpeechBrain load failed:\n%s", traceback.format_exc())
+            raise DiarizationError(500, f"Could not load speaker encoder: {e}") from e
+        return encoder
 
     def ensure_loaded(self) -> Any:
-        if self._pipeline is not None:
-            return self._pipeline
+        if self._encoder is not None:
+            return self._encoder
         with self._lock:
-            if self._pipeline is None:
-                self._pipeline = self._build()
-        return self._pipeline
+            if self._encoder is None:
+                self._encoder = self._build()
+        return self._encoder
 
-    def diarize(
+    def diarize_chunks(
         self,
-        audio_path: str,
+        audio_array,
+        sampling_rate: int,
+        whisper_chunks: list[dict],
         num_speakers: int | None,
         min_speakers: int | None,
         max_speakers: int | None,
-    ) -> list[dict]:
-        pipe = self.ensure_loaded()
+    ) -> tuple[list[dict], list[dict]]:
+        """Run diarization. Returns (lines, raw_segments).
 
-        kwargs: dict[str, Any] = {}
+        lines:           [{speaker: "SPEAKER_00", start, end, text}, ...]
+        raw_segments:    same shape as lines, used for audit.
+        """
+        import numpy as np  # type: ignore
+        import torch  # type: ignore
+
+        encoder = self.ensure_loaded()
+
+        utterances = self._group_into_utterances(whisper_chunks, GAP_THRESHOLD_S)
+        if not utterances:
+            return [], []
+        if len(utterances) == 1:
+            u = utterances[0]
+            line = {"speaker": "SPEAKER_00", "start": u["start"], "end": u["end"], "text": u["text"]}
+            return [line], [line]
+
+        embeddings = []
+        for utt in utterances:
+            s = int(utt["start"] * sampling_rate)
+            e = int(utt["end"] * sampling_rate)
+            slice_arr = audio_array[s:e]
+            min_len = int(MIN_UTT_S * sampling_rate)
+            if len(slice_arr) < min_len:
+                slice_arr = np.pad(slice_arr, (0, min_len - len(slice_arr)))
+            tensor = torch.tensor(slice_arr, dtype=torch.float32).unsqueeze(0).to(self._device)
+            with torch.no_grad():
+                emb = encoder.encode_batch(tensor).squeeze().cpu().numpy()
+            embeddings.append(emb)
+
+        emb_matrix = np.stack(embeddings)
+        emb_matrix = emb_matrix / (np.linalg.norm(emb_matrix, axis=1, keepdims=True) + 1e-9)
+
+        labels = self._cluster(emb_matrix, num_speakers, min_speakers, max_speakers)
+
+        raw_segments = [
+            {
+                "speaker": f"SPEAKER_{int(label):02d}",
+                "start": utt["start"],
+                "end": utt["end"],
+                "text": utt["text"],
+            }
+            for utt, label in zip(utterances, labels)
+        ]
+
+        lines: list[dict] = []
+        for seg in raw_segments:
+            if lines and lines[-1]["speaker"] == seg["speaker"]:
+                lines[-1]["end"] = seg["end"]
+                lines[-1]["text"] = (lines[-1]["text"] + " " + seg["text"]).strip()
+            else:
+                lines.append(dict(seg))
+
+        return lines, raw_segments
+
+    @staticmethod
+    def _cluster(
+        embeddings,
+        num_speakers: int | None,
+        min_speakers: int | None,
+        max_speakers: int | None,
+    ):
+        from sklearn.cluster import AgglomerativeClustering  # type: ignore
+
+        n_samples = len(embeddings)
         if num_speakers is not None:
-            kwargs["num_speakers"] = num_speakers
-        else:
-            if min_speakers is not None:
-                kwargs["min_speakers"] = min_speakers
-            if max_speakers is not None:
-                kwargs["max_speakers"] = max_speakers
+            k = max(1, min(num_speakers, n_samples))
+            clusterer = AgglomerativeClustering(n_clusters=k, metric="cosine", linkage="average")
+            return clusterer.fit_predict(embeddings)
 
-        try:
-            diarization = pipe(audio_path, **kwargs)
-        except Exception as e:
-            raise DiarizationError(500, f"Diarization failed: {e}") from e
+        clusterer = AgglomerativeClustering(
+            n_clusters=None,
+            metric="cosine",
+            linkage="average",
+            distance_threshold=DEFAULT_DISTANCE_THRESHOLD,
+        )
+        labels = clusterer.fit_predict(embeddings)
+        n_found = len(set(labels))
 
-        segments: list[dict] = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            segments.append(
-                {"start": float(turn.start), "end": float(turn.end), "speaker": speaker}
-            )
-        segments.sort(key=lambda s: s["start"])
-        return segments
+        if min_speakers and n_found < min_speakers:
+            k = min(min_speakers, n_samples)
+            return AgglomerativeClustering(
+                n_clusters=k, metric="cosine", linkage="average"
+            ).fit_predict(embeddings)
+        if max_speakers and n_found > max_speakers:
+            k = min(max_speakers, n_samples)
+            return AgglomerativeClustering(
+                n_clusters=k, metric="cosine", linkage="average"
+            ).fit_predict(embeddings)
+        return labels
+
+    @staticmethod
+    def _group_into_utterances(chunks: list[dict], gap_threshold: float) -> list[dict]:
+        utterances: list[dict] = []
+        for chunk in chunks:
+            ts = chunk.get("timestamp")
+            if not ts or ts[0] is None:
+                continue
+            start = float(ts[0])
+            end = float(ts[1]) if ts[1] is not None else start
+            text = chunk.get("text", "")
+            if utterances and start - utterances[-1]["end"] < gap_threshold:
+                utterances[-1]["end"] = end
+                utterances[-1]["text"] += text
+            else:
+                utterances.append({"start": start, "end": end, "text": text})
+
+        out = []
+        for u in utterances:
+            u["text"] = u["text"].strip()
+            if u["text"]:
+                out.append(u)
+        return out
 
     def info(self) -> dict:
         return {
-            "diarization_model": self._settings.diarization_model,
-            "loaded": self._pipeline is not None,
-            "device": self._device if self._pipeline is not None else None,
-            "default_num_speakers": self._settings.default_num_speakers,
+            "diarization_backend": "speechbrain-ecapa",
+            "encoder": ENCODER_MODEL,
+            "loaded": self._encoder is not None,
+            "device": self._device if self._encoder is not None else None,
         }
 
 
-def stitch(diarization: list[dict], whisper_chunks: list[dict]) -> list[dict]:
-    """Assign each Whisper word/chunk to the diarization segment containing its midpoint,
-    then group consecutive same-speaker chunks into one line."""
-    lines: list[dict] = []
-
-    for chunk in whisper_chunks:
-        timestamp = chunk.get("timestamp")
-        if not timestamp or timestamp[0] is None:
-            continue
-        word_start = float(timestamp[0])
-        word_end = float(timestamp[1]) if timestamp[1] is not None else word_start
-        midpoint = (word_start + word_end) / 2.0
-
-        speaker = "UNKNOWN"
-        best_overlap = 0.0
-        for seg in diarization:
-            if seg["start"] <= midpoint < seg["end"]:
-                speaker = seg["speaker"]
-                break
-            overlap = min(seg["end"], word_end) - max(seg["start"], word_start)
-            if overlap > best_overlap:
-                best_overlap = overlap
-                speaker = seg["speaker"]
-
-        text = chunk.get("text", "")
-        if lines and lines[-1]["speaker"] == speaker:
-            lines[-1]["text"] += text
-            lines[-1]["end"] = word_end
-        else:
-            lines.append({"speaker": speaker, "start": word_start, "end": word_end, "text": text})
-
-    for line in lines:
-        line["text"] = line["text"].strip()
-    return [line for line in lines if line["text"]]
-
-
 def relabel(lines: list[dict]) -> list[dict]:
-    """Rewrite raw pyannote labels (SPEAKER_00, SPEAKER_01, ...) to Speaker 1/2/...
-    in order of first appearance."""
     mapping: dict[str, str] = {}
     out = []
     for line in lines:
