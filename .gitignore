@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
+uploads/
+*.wav
+*.mp3
+*.m4a
+*.mp4a
+
+hf_space/
